@@ -19,69 +19,38 @@ and reports per-category findings using the rules the user has defined.
 
 ## Step 0 — First-Run Setup
 
-Before doing anything else, check whether a config file exists at
-`~/.claude/skills/meta-analysis/config.json`.
-
-Run this check:
+Check whether a config file exists:
 ```bash
 cat ~/.claude/skills/meta-analysis/config.json 2>/dev/null || echo "NO_CONFIG"
 ```
 
 **If config exists:** load it and skip to Step 1.
 
-**If NO_CONFIG:** run the setup wizard below.
-
-### Setup Wizard
-
-Tell the user:
+**If NO_CONFIG:** tell the user:
 > "This is the first time you're running /meta-analysis. I need three things to get started —
 > your Cat View Google Sheet, your service account credentials file, and your rules Google Doc."
 
-Then ask the following questions **one at a time** using AskUserQuestion:
+Ask the following using AskUserQuestion, one at a time:
 
-**Q1 — Sheet URL**
-"Paste the URL of your Cat View Google Sheet (the tab should be named 'Cat View')."
-Free-text input.
+**Q1:** "Paste the URL of your Cat View Google Sheet (the tab must be named 'Cat View')."
+**Q2:** "Full path to your Google service account JSON file? (Needs read access to both sheet and doc.) Example: ~/.credentials/my-service-account.json"
+**Q3:** "Paste the URL of your rules Google Doc — or type 'skip' to use built-in default rules."
 
-**Q2 — Service Account Credentials**
-"What is the full path to your Google service account JSON file?
-This account needs read access to both the sheet and the rules doc.
-Example: ~/.credentials/my-service-account.json"
-Free-text input.
-
-**Q3 — Rules Doc URL**
-"Paste the URL of your rules Google Doc.
-This is where your analysis rules are written — the skill will read and apply them on every run.
-If you don't have one yet, type 'skip' and the skill will use a set of built-in default rules."
-Free-text input.
-
-After collecting answers, extract the Sheet ID from the Sheet URL
-(format: `https://docs.google.com/spreadsheets/d/{SHEET_ID}/...`)
-and the Doc ID from the Doc URL
-(format: `https://docs.google.com/document/d/{DOC_ID}/...`).
-
-Save config:
+Extract Sheet ID and Doc ID from URLs, then save:
 ```bash
 python3 - <<'PYEOF'
 import json, os, re
-
-sheet_url  = "SHEET_URL_PLACEHOLDER"
-creds_path = "CREDS_PATH_PLACEHOLDER"
-doc_url    = "DOC_URL_PLACEHOLDER"
-
-def extract_id(url, pattern):
-    m = re.search(pattern, url)
+sheet_url  = "SHEET_URL"
+creds_path = "CREDS_PATH"
+doc_url    = "DOC_URL"
+def extract_id(url, pat):
+    m = re.search(pat, url)
     return m.group(1) if m else url.strip()
-
-sheet_id = extract_id(sheet_url, r'/spreadsheets/d/([a-zA-Z0-9_-]+)')
-doc_id   = extract_id(doc_url,   r'/document/d/([a-zA-Z0-9_-]+)') if doc_url.lower() != 'skip' else None
-
 config = {
-    "sheet_id":   sheet_id,
+    "sheet_id":   extract_id(sheet_url,  r'/spreadsheets/d/([a-zA-Z0-9_-]+)'),
     "creds_path": os.path.expanduser(creds_path.strip()),
-    "doc_id":     doc_id
+    "doc_id":     extract_id(doc_url, r'/document/d/([a-zA-Z0-9_-]+)') if doc_url.lower() != 'skip' else None
 }
-
 path = os.path.expanduser("~/.claude/skills/meta-analysis/config.json")
 with open(path, "w") as f:
     json.dump(config, f, indent=2)
@@ -89,20 +58,18 @@ print(json.dumps(config))
 PYEOF
 ```
 
-Confirm to the user that setup is complete and proceed with Step 1.
-
 ---
 
-## Step 1 — Fetch Rules
-
-Load the config, then fetch the rules from the user's Google Doc (if `doc_id` is set).
+## Step 1 — Load Config, Rules, and Last Run
 
 ```python
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import json, os
 
-config_path = os.path.expanduser("~/.claude/skills/meta-analysis/config.json")
+config_path   = os.path.expanduser("~/.claude/skills/meta-analysis/config.json")
+last_run_path = os.path.expanduser("~/.claude/skills/meta-analysis/last_run.json")
+
 with open(config_path) as f:
     cfg = json.load(f)
 
@@ -118,10 +85,11 @@ creds = service_account.Credentials.from_service_account_file(
     ]
 )
 
+# Fetch rules doc
 rules_text = None
 if DOC_ID:
-    docs_service = build("docs", "v1", credentials=creds)
-    doc = docs_service.documents().get(documentId=DOC_ID).execute()
+    docs_svc = build("docs", "v1", credentials=creds)
+    doc = docs_svc.documents().get(documentId=DOC_ID).execute()
     parts = []
     for elem in doc.get("body", {}).get("content", []):
         para = elem.get("paragraph")
@@ -132,15 +100,21 @@ if DOC_ID:
                     parts.append(tr.get("content", ""))
     rules_text = "".join(parts).strip()
 
-print("RULES_TEXT:", rules_text or "USE_DEFAULTS")
+# Load last run if it exists
+last_run = None
+if os.path.exists(last_run_path):
+    with open(last_run_path) as f:
+        last_run = json.load(f)
+
+print("RULES:", rules_text or "USE_DEFAULTS")
+print("LAST_RUN_EXISTS:", last_run is not None)
 ```
 
-If `rules_text` is returned, use it as the analysis ruleset in Step 3.
-If `USE_DEFAULTS`, fall back to the built-in rules in the **Default Rules** section below.
+Keep `rules_text` and `last_run` in memory for Steps 3 and 4.
 
 ---
 
-## Step 2 — Fetch & Parse the Sheet
+## Step 2 — Fetch & Parse Sheet, Compute Efficient Frontier
 
 ```python
 from googleapiclient.discovery import build
@@ -151,27 +125,24 @@ config_path = os.path.expanduser("~/.claude/skills/meta-analysis/config.json")
 with open(config_path) as f:
     cfg = json.load(f)
 
-CREDS_FILE = cfg["creds_path"]
-SHEET_ID   = cfg["sheet_id"]
-
 creds = service_account.Credentials.from_service_account_file(
-    CREDS_FILE, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    cfg["creds_path"], scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
 )
 service = build("sheets", "v4", credentials=creds)
 
 header_text = service.spreadsheets().values().get(
-    spreadsheetId=SHEET_ID, range="Cat View!1:1"
+    spreadsheetId=cfg["sheet_id"], range="Cat View!1:1"
 ).execute().get("values", [[]])[0]
 
 rows = service.spreadsheets().values().get(
-    spreadsheetId=SHEET_ID, range="Cat View",
+    spreadsheetId=cfg["sheet_id"], range="Cat View",
     valueRenderOption="UNFORMATTED_VALUE"
 ).execute().get("values", [])
 
-col_labels    = header_text[2:]
-monthly_cols  = list(range(0, 4))
-weekly_cols   = list(range(4, 8))
-daily_cols    = list(range(8, len(col_labels)))
+col_labels   = header_text[2:]
+monthly_cols = list(range(0, 4))
+weekly_cols  = list(range(4, 8))
+daily_cols   = list(range(8, len(col_labels)))
 
 def safe_float(v):
     try: return float(v)
@@ -188,11 +159,11 @@ for row in rows[1:]:
     vals = vals + [""] * (len(col_labels) - len(vals))
     data[(current_cat, metric)] = vals
 
-# Find last daily column with actual data (using Overall Revenue as probe)
+# Find last daily column with actual data
 rev_row = data.get(("Overall", "Revenue"), [])
 last_filled = 8
 for i in daily_cols:
-    if i < len(rev_row) and safe_float(rev_row[i]) is not None and safe_float(rev_row[i]) > 0:
+    if i < len(rev_row) and safe_float(rev_row[i]) and safe_float(rev_row[i]) > 0:
         last_filled = i
 
 last30 = list(range(max(8, last_filled - 29), last_filled + 1))
@@ -220,96 +191,204 @@ output = {
 }
 
 for cat in categories:
-    output["categories"][cat] = {}
+    cat_data = {}
     for met in key_metrics:
-        output["categories"][cat][met] = {
+        cat_data[met] = {
             "monthly": get_vals(cat, met, monthly_cols),
             "weekly":  get_vals(cat, met, weekly_cols),
             "last7":   get_vals(cat, met, last7),
             "last30":  get_vals(cat, met, last30),
         }
 
+    # ── Efficient Frontier ──────────────────────────────────────────────────
+    # Find the week or month with the best ROAS and the spend level that week
+    roas_m = cat_data.get("ROAS Perf", {}).get("monthly", [])
+    sp_m   = (cat_data.get("Total Spends", {}) if cat == "Overall"
+              else cat_data.get("Perf Spends", {})).get("monthly", [])
+    roas_w = cat_data.get("ROAS Perf", {}).get("weekly", [])
+    sp_w   = (cat_data.get("Total Spends", {}) if cat == "Overall"
+              else cat_data.get("Perf Spends", {})).get("weekly", [])
+
+    best_roas, best_spend, best_label = 0, None, "unknown"
+    for i, (r, s) in enumerate(zip(roas_m, sp_m)):
+        if r and r > best_roas:
+            best_roas, best_spend = r, s
+            best_label = output["col_labels"]["monthly"][i] if i < len(output["col_labels"]["monthly"]) else f"M{i}"
+    for i, (r, s) in enumerate(zip(roas_w, sp_w)):
+        if r and r > best_roas:
+            best_roas, best_spend = r, s
+            best_label = output["col_labels"]["weekly"][i] if i < len(output["col_labels"]["weekly"]) else f"W{i}"
+
+    # Current ROAS and spend (latest monthly — index 2 = most recent complete month)
+    current_roas  = roas_m[2] if len(roas_m) > 2 else None
+    current_spend = sp_m[2]   if len(sp_m)   > 2 else None
+
+    # ── ₹ Impact (for volume-weighted summary) ──────────────────────────────
+    # (best_roas - current_roas) × current monthly spend = foregone revenue
+    rupee_impact = None
+    if best_roas and current_roas and current_spend:
+        rupee_impact = (best_roas - current_roas) * current_spend
+
+    cat_data["_meta"] = {
+        "efficient_frontier": {
+            "best_roas":   best_roas,
+            "best_spend":  best_spend,
+            "best_label":  best_label,
+        },
+        "current": {
+            "roas":  current_roas,
+            "spend": current_spend,
+        },
+        "rupee_impact": rupee_impact,   # positive = efficiency loss vs historical best
+    }
+
+    output["categories"][cat] = cat_data
+
 print(json.dumps(output))
 ```
 
 ---
 
-## Step 3 — Analyse & Report
+## Step 3 — Analyse Using Rules
 
-Using the parsed JSON from Step 2 and the rules from Step 1, perform the following for each
-category and Overall:
+Using the parsed JSON from Step 2, apply the rules from the user's doc (or defaults below).
 
-### Time Horizons
-For each category, compute and summarise across all four:
-- **Day-on-day:** last 7 days — direction (up/down/flat) for Revenue, Spends, ROAS, CVR, CTR excl AN, CPM, AN%
-- **Week-on-week:** last 4 weekly columns — latest vs prior week % change for Revenue, Spends, ROAS
-- **MTD:** Jun MTD daily run rate vs prior complete month daily run rate (divide monthly total by days in month)
-- **Month-on-month:** last 3 complete monthly columns — trend direction and magnitude for Revenue, Spends, ROAS, Orders
+### For each category compute
 
-### Applying the Rules
-Read the rules text fetched from the user's Google Doc (Step 1). Apply each rule stated there to
-each category. The rules doc is the authoritative source — follow it exactly.
+**Trend directions** across all four time horizons:
+- Direction = "up" if second half avg > first half avg by >5%, "down" if <-5%, else "flat"
+- For D/D 7-day: also note single-day spikes/drops >20%
 
-If `USE_DEFAULTS` (no rules doc provided), apply the **Default Rules** section below.
+**Spend-driven vs genuine ROAS** (critical check before applying R1):
+- Compare ROAS direction vs spend direction over the same window
+- If ROAS up + spend down → efficiency ceiling (R3), not scale signal (R1)
+- If ROAS up + spend flat or up → genuine scale signal (R1)
+- State this explicitly in the output
 
-### Report Format
-For each category (Overall first):
+**Creative fatigue vs audience exhaustion** (apply whenever ROAS is declining, R10):
+- Check CPM direction and CTR direction together:
+  - CPM stable/down + CTR down → creative fatigue → recommend creative refresh
+  - CPM up + CTR flat or down → audience exhaustion → recommend audience expansion or spend reduction
+- Name the diagnosis explicitly
+
+**Efficient frontier** (R13 — always):
+- Pull `_meta.efficient_frontier` from parsed data
+- State: "Best efficiency: ROAS [X] at [₹Y/month] spend ([period])"
+- State current: "Current: ROAS [X] at [₹Y/month]"
+- If current spend > best_spend and ROAS is lower: flag overspend past the efficiency ceiling
+
+**Vs last run** (R15 — if last_run exists):
+- Compare current key metrics (ROAS, Revenue, Spend, AN%, CTR) to last_run values for the same category
+- Flag anything that has moved >10% since the last run
+
+### 99 Offer contribution check (always):
+Compute: 99 Revenue ÷ Overall Revenue for each time horizon.
+Target band: 10–15%. Flag if outside.
+
+### Volume-weighted summary (R14 — for the final Overall Summary):
+Rank all category findings by `rupee_impact` descending.
+Lead with the highest ₹ impact item. State the ₹ figure.
+
+---
+
+## Step 4 — Save Current Run
+
+After analysis, save key metrics to last_run.json for future comparison:
+
+```python
+import json, os
+from datetime import date
+
+last_run_path = os.path.expanduser("~/.claude/skills/meta-analysis/last_run.json")
+
+# Build a compact snapshot: category → {roas, revenue, spend, an_pct, ctr} at latest monthly
+snapshot = {
+    "run_date": date.today().isoformat(),
+    "categories": {}
+}
+
+# `output` is the parsed data from Step 2
+for cat, cd in output["categories"].items():
+    def m2(met):
+        vals = cd.get(met, {}).get("monthly", [])
+        return vals[2] if len(vals) > 2 else None
+
+    snapshot["categories"][cat] = {
+        "roas":    m2("ROAS Perf"),
+        "revenue": m2("Revenue"),
+        "spend":   m2("Total Spends") if cat == "Overall" else m2("Perf Spends"),
+        "an_pct":  m2("AN Percentage") if cat == "Overall" else m2("% of AN Sessions"),
+        "ctr":     m2("CTR Perf excl AN"),
+        "cvr":     m2("Perf CVR"),
+    }
+
+with open(last_run_path, "w") as f:
+    json.dump(snapshot, f, indent=2)
+print("Snapshot saved to last_run.json")
+```
+
+---
+
+## Step 5 — Report Format
+
+For each category (Overall first, then ranked by ₹ impact for the rest):
 
 ```
 ## [Category Name]
 
 **Trend Summary:** [one sentence]
 
+**Efficient Frontier:** Best ROAS [X] at [₹Y/month] spend ([period]) | Current: ROAS [X] at [₹Y/month]
+
 **Time Horizon Breakdown:**
 - D/D (7 days): Revenue [direction], Spends [direction], ROAS [direction]
-- W/W: latest vs prior — Revenue [+X%], Spends [+X%], ROAS [+X%]
+- W/W: Revenue [+X%], Spends [+X%], ROAS [+X%] (latest vs prior week)
 - MTD DRR: Revenue [₹X/day] vs prior month [₹X/day]
 - M/M (last 3 months): Revenue [trend], ROAS [trend]
 
-**Rules Triggered:** [which rules and why]
+**ROAS Signal:** [Genuine scale / Efficiency ceiling / Declining — which one and why]
 
-**Diagnosis:** [which funnel metric is responsible]
+**Diagnosis:** [Creative fatigue / Audience exhaustion / other — state explicitly]
 
-**Suggested Action:** [specific and actionable]
+**Rules Triggered:** [R1, R5, R10 etc. with one-line reason each]
+
+**Suggested Action:** [Specific and actionable. Never "pause".]
+
+**Vs Last Run ([date]):** [Key metric changes since prior analysis, or "No prior run"]
 ```
 
 Skip categories with no data across all time horizons.
 
-End with a **1-paragraph Overall Summary** — top 2–3 findings and the single most urgent action.
+**Overall Summary** (last section):
+- Rank findings by ₹ impact (R14)
+- 3–5 bullet points, highest ₹ impact first
+- Single most urgent action as the closing line
 
-### Arguments
+---
+
+## Arguments
 If a category name is passed as the skill argument, only analyse that category + Overall.
 
 ---
 
 ## Default Rules
 
-Used only when no rules doc is provided. These cover standard Meta Ads performance patterns:
+Used only when no rules doc is provided.
 
-**Priority:** Revenue is always the first metric to check. CTR/CVR are secondary diagnostics.
+**Priority:** Revenue first. CTR/CVR are secondary diagnostics.
 
-**Scale signal:** If spends are increasing AND ROAS is increasing → positive, can scale.
-
-**Early warning:** If CTR or CVR is decaying even when ROAS appears stable → flag as early warning of future ROAS decline.
-
-**Spends up, ROAS holding:** Compare against best historical period for that category. Report what funnel metrics looked like then vs now.
-
-**Revenue declining + spends up:** ROAS is falling. Diagnose: CTR decay? CVR decay? CPM increase? CPS increase? AN% increase? Suggest what to improve to recover to historical best.
-
-**Revenue declining + spends flat:** Check CPM, CPS, AN% for audience saturation. Report whether headroom to scale exists.
-
-**Revenue holding + spends up:** Flag — ROAS is falling silently. Diagnose.
-
-**Revenue holding + spends flat:** Assess scalability — CPM trend, CPS trend, AN%, CTR.
-
-**ROAS decline:** No fixed floor. Compare to the same category's best historical period. Never recommend pausing. If not improving consistently, recommend creative refresh, offer change, or targeting adjustment.
-
-**AN% — overall:** Flag if overall AN% exceeds 20%.
-
-**AN% — category:** Only flag if ROAS worsened at the same time AN% increased. If ROAS was better at high AN%, that is a positive data point.
-
-**Revenue holding definition:** Flat within a 7-day window.
-
-**New launches:** Any category with fewer than 20 days of spend data — report direction only, skip rules.
-
-**No cross-category comparisons:** Each category is assessed against its own historical trajectory only.
+R1 — Scale signal: Spends up + ROAS up → flag positive. Confirm spend is not falling (else R3).
+R2 — Early warning: CTR excl AN or CVR declining even when ROAS holds → flag as leading indicator.
+R3 — Efficiency ceiling: ROAS up + spend down → not a scale signal. State efficient spend level.
+R4 — Spend up, ROAS holding: compare funnel metrics to best historical period. Report findings.
+R5 — Revenue declining + spend up: diagnose with R10. Compare to efficient frontier.
+R6 — Revenue declining + spend flat: check CPM, CPS, AN% for saturation.
+R7 — Revenue holding + spend up: flag silent ROAS decline. Diagnose with R10.
+R8 — Revenue holding + spend flat: assess scalability via CPM, CPS, AN%, CTR.
+R9 — ROAS decline: compare to efficient frontier. Identify which funnel metric changed. Never pause.
+R10 — Creative fatigue vs audience exhaustion: CPM down + CTR down = fatigue. CPM up + CTR flat/down = exhaustion.
+R11 — AN% overall >20%: flag immediately.
+R12 — AN% category: only flag if ROAS also worsened. If ROAS was better at high AN%, note as positive.
+R13 — Efficient frontier: always compute and display.
+R14 — Volume-weighted summary: rank by ₹ impact = (best ROAS − current ROAS) × monthly spend.
+R15 — Vs last run: compare to last_run.json if it exists.
